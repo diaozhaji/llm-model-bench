@@ -194,6 +194,120 @@ def find_num(text, n):
             pass
     return False
 
+
+# ============================================================ 多语言执行器 (hard 套件)
+
+def _run_cmd(cmd, workdir, timeout):
+    try:
+        r = subprocess.run(cmd, cwd=workdir, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "TIMEOUT"
+    except Exception as e:
+        return 125, "", str(e)
+
+
+def run_java_tests(code, cases, timeout=30):
+    """Java 判分: 提取 Java 源码, 包一层 Main+断言 harness 编译运行。
+    code 需含一个类; cases: [(调用语句模板, 期望输出行)]。
+    模板里 {expr} 会被替换。"""
+    results, fails = 0, []
+    d = tempfile.mkdtemp(prefix="jbench_")
+    try:
+        harness = (
+            "public class Harness {\n"
+            "  public static void main(String[] a) throws Exception {\n"
+            "    %s\n"
+            "  }\n"
+            "}\n" % "\n    ".join("{\n      %s\n    }" % c for c in cases)
+        )
+        src = code + "\n" + harness
+        src_path = os.path.join(d, "Harness.java")
+        # 去掉可能的 package 声明
+        src = re.sub(r"^\s*package\s+[\w.]+\s*;", "", src, flags=re.M)
+        # 模型常写 public class X → 文件名约束冲突, 降级为非 public(不影响行为)
+        src = re.sub(r"\bpublic\s+(class|interface|enum)\b", r"\1", src)
+        with open(src_path, "w", encoding="utf-8") as f:
+            f.write(src)
+        rc, out, err = _run_cmd(["javac", "-encoding", "UTF-8", "Harness.java"], d, timeout)
+        if rc != 0:
+            return 0, len(cases), ["javac 编译失败: %s" % err.splitlines()[-1][:180] if err else "?"]
+        rc, out, err = _run_cmd(["java", "-cp", ".", "Harness"], d, timeout)
+        if rc != 0:
+            return 0, len(cases), ["运行失败: %s" % (err.splitlines()[-1][:180] if err else "?")]
+        for line in out.splitlines():
+            if line.startswith("CASE "):
+                if line.startswith("CASE PASS"):
+                    results += 1
+                else:
+                    fails.append(line[:180])
+        # 缺失的用例按失败计
+        reported = sum(1 for l in out.splitlines() if l.startswith("CASE "))
+        if reported < len(cases):
+            fails.append("仅输出了 %d/%d 个用例结果" % (reported, len(cases)))
+        return results, len(cases), fails
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def run_js_tests(code, cases, timeout=15):
+    """Node 判分: 追加 console.log 断言尾码, node 运行比对。
+    cases: [(JS 表达式或语句, 期望 console.log 输出 repr)]"""
+    results, fails = 0, []
+    tail = "\n;(async()=>{\n"
+    for i, (expr, expected) in enumerate(cases):
+        tail += (
+            "try{const v=await (eval(`(%s)`));"
+            "console.log('R%d:'+JSON.stringify(v))}catch(e){console.log('R%d:E:'+e.message)}\n"
+            % (expr, i, i)
+        )
+    tail += "})();\n"
+    prog = code + "\n" + tail
+    d = tempfile.mkdtemp(prefix="jsbench_")
+    try:
+        p = os.path.join(d, "t.js")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(prog)
+        rc, out, err = _run_cmd(["node", "t.js"], d, timeout)
+        if rc != 0 and not out:
+            return 0, len(cases), ["node 运行失败: %s" % err.splitlines()[-1][:160] if err else "?"]
+        for i, (expr, expected) in enumerate(cases):
+            # expected 统一为 JSON 字面量 (与 JSON.stringify 输出对称)
+            hit = False
+            want_obj = None
+            try:
+                want_obj = json.loads(expected)
+            except Exception:
+                want_obj = expected
+            for line in out.splitlines():
+                if line.startswith("R%d:" % i):
+                    got = line.split(":", 1)[1]
+                    try:
+                        hit = json.loads(got) == want_obj
+                    except Exception:
+                        hit = got == expected
+                    if not hit:
+                        fails.append("用例 %d 实际=%s 期望=%s" % (i, got[:60], expected[:60]))
+                    break
+            else:
+                fails.append("用例 %d 无输出" % i)
+            if hit:
+                results += 1
+        return results, len(cases), fails
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def run_lang_tests(lang, code, cases, timeout=15):
+    if lang == "java":
+        return run_java_tests(code, cases, timeout=timeout)
+    if lang == "node":
+        return run_js_tests(code, cases, timeout=timeout)
+    return run_tests(code, cases, timeout=timeout)
+
 # ============================================================ 题库
 
 CODE_TASKS = [
@@ -454,7 +568,7 @@ def bench_code(args):
             item["got"] = got[:120]
         else:
             # 逐块验证取最优（兼容思维链模型：草稿块也算，取通过数最高的）
-            blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", raw, re.S)
+            blocks = re.findall(r"```[^\n]*\n(.*?)```", raw, re.S)
             if not blocks:
                 blocks = [raw.strip()]
             best = None
@@ -753,6 +867,185 @@ def gen_report_md(result, meta, summary):
 
 # ============================================================ main
 
+# ============================================================ hard 套件执行
+
+def bench_hard(args):
+    """hard 套件: B+ 9 代码题 + H 3 题静态 + H3 + Agent 4 题 + D 3 题 = 20 项。"""
+    import hard_tasks as ht
+    out = []
+
+    # --- B+ 多语言代码题 ---
+    print("== Hard B+: 多语言代码 ==", flush=True)
+    for task in ht.HARD_CODE_TASKS:
+        r, err = safe_call(api_chat, args.base_url, args.model,
+                           [{"role": "user", "content": task["prompt"]}],
+                           max_tokens=args.max_tokens_override or 4096,
+                           temperature=0, timeout=args.timeout, api_key=args.api_key)
+        item = {"id": task["id"], "name": task["name"], "ok": False}
+        if err:
+            item["error"] = err
+            out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+            continue
+        raw = answer_text(r)
+        item["content_len"] = len(r.get("text") or "")
+        item["reasoning_len"] = len(r.get("reasoning") or "")
+        blocks = re.findall(r"```[^\n]*\n(.*?)```", raw, re.S)
+        best = None
+        for b in blocks:
+            passed, total, fails = run_lang_tests(task["lang"], b.strip(), task["cases"])
+            if best is None or passed > best[0]:
+                best = (passed, total, fails)
+            if best[0] == best[1]:
+                break
+        if best is None:
+            best = (0, len(task["cases"]), ["未找到代码块"])
+        item.update({"passed": best[0], "total": best[1], "ok": best[0] == best[1],
+                     "fails": best[2], "n_code_blocks": len(blocks)})
+        out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+
+    # --- H 爬虫/HTML 静态题 ---
+    print("== Hard H: 爬虫/HTML ==", flush=True)
+    for task in ht.HARD_SCRAPE_TASKS:
+        r, err = safe_call(api_chat, args.base_url, args.model,
+                           [{"role": "user", "content": task["prompt"]}],
+                           max_tokens=args.max_tokens_override or 4096,
+                           temperature=0, timeout=args.timeout, api_key=args.api_key)
+        item = {"id": task["id"], "name": task["name"], "ok": False}
+        if err:
+            item["error"] = err
+            out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+            continue
+        raw = answer_text(r)
+        item["reasoning_len"] = len(r.get("reasoning") or "")
+        blocks = re.findall(r"```[^\n]*\n(.*?)```", raw, re.S)
+        best = None
+        for b in blocks:
+            passed, total, fails = run_lang_tests("python", b.strip(), task["cases"])
+            if best is None or passed > best[0]:
+                best = (passed, total, fails)
+            if best[0] == best[1]:
+                break
+        if best is None:
+            best = (0, len(task["cases"]), ["未找到代码块"])
+        item.update({"passed": best[0], "total": best[1], "ok": best[0] == best[1],
+                     "fails": best[2], "n_code_blocks": len(blocks)})
+        out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+
+    # --- H3 分页爬取（mock server 真实 HTTP） ---
+    item = ht.run_h3(api_chat, args, ht.H3_PROMPT)
+    item["reasoning_len"] = None
+    out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+
+    # --- Agent 4 题 ---
+    print("== Hard C+: 长 Agent ==", flush=True)
+    for agent_fn in (ht.agent_a4_order_chain, ht.agent_a5_error_degrade,
+                     ht.agent_a6_instruction_persist, ht.agent_a7_crawl):
+        item = agent_fn(api_chat, args)
+        out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+
+    # --- D 难题 ---
+    print("== Hard D+: 难题 ==", flush=True)
+    for task in ht.HARD_QA_TASKS:
+        r, err = safe_call(api_chat, args.base_url, args.model,
+                           [{"role": "user", "content": task["prompt"]}],
+                           max_tokens=args.max_tokens_override or 4096,
+                           temperature=0, timeout=args.timeout, api_key=args.api_key)
+        item = {"id": task["id"], "topic": task["topic"]}
+        if err:
+            item["error"] = err
+        elif task.get("cases"):
+            # 代码形态的 D 题(如正则实现题): 提取代码块跑真实单测
+            raw = answer_text(r)
+            blocks = re.findall(r"```[^\n]*\n(.*?)```", raw, re.S)
+            best = None
+            for b in blocks:
+                passed, total, fails = run_lang_tests("python", b.strip(), task["cases"])
+                if best is None or passed > best[0]:
+                    best = (passed, total, fails)
+                if best[0] == best[1]:
+                    break
+            if best is None:
+                best = (0, len(task["cases"]), ["未找到代码块"])
+            item.update({"passed": best[0], "total": best[1],
+                         "ok": best[0] == best[1], "fails": best[2]})
+        else:
+            ans = extract_answer(answer_text(r))
+            item["answer_line"] = ans[:60]
+            item["ok"] = bool(task["check"](ans))
+        out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+    return out
+
+
+def summarize_hard(hard):
+    if not hard:
+        return {}
+    passed = sum(x.get("passed", 1 if x.get("ok") else 0) for x in hard)
+    total = sum(x.get("total", 1) for x in hard)
+    s = {"hard": "%d/%d" % (passed, total),
+         "hard_pct": "%.0f%%" % (100.0 * passed / total if total else 0)}
+    groups = {}
+    for x in hard:
+        gid = x["id"][0]
+        if gid in "JPN":
+            g = "code"
+        elif gid == "H":
+            g = "scrape"
+        elif gid == "A":
+            g = "agent"
+        else:
+            g = "puzzle"
+        p = x.get("passed", 1 if x.get("ok") else 0)
+        t = x.get("total", 1)
+        groups.setdefault(g, [0, 0])
+        groups[g][0] += p
+        groups[g][1] += t
+    for g, (p, t) in groups.items():
+        s["hard_" + g] = "%d/%d" % (p, t)
+    return s
+
+
+def gen_hard_report_md(hard, meta, summary):
+    L = []
+    L.append("# LLM 模型评测报告（hard 区分度套件）")
+    L.append("")
+    L.append("- **被测模型**：%s" % meta["model"])
+    L.append("- **端点**：%s" % meta["base_url"])
+    L.append("- **机器**：%s" % meta.get("machine"))
+    L.append("- **测试时间**：%s" % meta.get("time"))
+    L.append("- **采样**：temperature=0（贪心解码，结果可复现）")
+    L.append("")
+    L.append("## 总分")
+    L.append("")
+    L.append("| 指标 | 结果 |")
+    L.append("|---|---|")
+    L.append("| hard 总分（20 项判分点） | %s |" % summary.get("hard"))
+    for k in ("hard_code", "hard_scrape", "hard_agent", "hard_puzzle"):
+        if k in summary:
+            names = {"hard_code": "B+ 多语言代码 (9 题)", "hard_scrape": "H 爬虫/HTML (4 题)",
+                     "hard_agent": "C+ 长 Agent (4 题)", "hard_puzzle": "D+ 难题 (3 题)"}
+            L.append("| %s | %s |" % (names[k], summary[k]))
+    L.append("")
+    L.append("## 逐项明细")
+    L.append("")
+    L.append("| 题号 | 题目 | 结果 | 判分/说明 |")
+    L.append("|---|---|---|---|")
+    for x in hard:
+        if x.get("error"):
+            note = x["error"][:120]
+        elif x["id"].startswith("A"):
+            note = json.dumps(x.get("detail", {}), ensure_ascii=False)[:150]
+        elif x.get("fails"):
+            note = "; ".join(x["fails"])[:150]
+        else:
+            note = x.get("answer_line", "")[:60] or "✓"
+        passed = x.get("passed", 1 if x.get("ok") else 0)
+        total = x.get("total", 1)
+        score = "✅" if x.get("ok") else ("❌" if total == 1 else "❌ %d/%d" % (passed, total))
+        L.append("| %s | %s | %s | %s |" % (x["id"], x.get("name") or x.get("topic", ""), score, note))
+    L.append("")
+    return "\n".join(L)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://localhost:1234")
@@ -767,33 +1060,47 @@ def main():
                     help="覆盖所有能力题的 max_tokens（0=用题库默认；推理模型建议 4096）")
     ap.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", ""),
                     help="API key（建议经 BENCH_API_KEY 环境变量传入）")
+    ap.add_argument("--suite", default="core", choices=["core", "hard", "all"],
+                    help="core=原 21 项；hard=区分度 20 项；all=两者都跑")
     args = ap.parse_args()
 
     skip = set(s.strip() for s in args.skip.split(",") if s.strip())
     result = {}
-    if "speed" not in skip:
-        result["speed"] = bench_speed(args)
-    if "code" not in skip:
-        result["code"] = bench_code(args)
-    if "agent" not in skip:
-        result["agent"] = bench_agent(args)
-    if "qa" not in skip:
-        result["qa"] = bench_qa(args)
+    if args.suite in ("core", "all"):
+        if "speed" not in skip:
+            result["speed"] = bench_speed(args)
+        if "code" not in skip:
+            result["code"] = bench_code(args)
+        if "agent" not in skip:
+            result["agent"] = bench_agent(args)
+        if "qa" not in skip:
+            result["qa"] = bench_qa(args)
+
+    hard = []
+    if args.suite in ("hard", "all"):
+        hard = bench_hard(args)
+        result["hard"] = hard
 
     summary = summarize(result)
+    if hard:
+        summary.update(summarize_hard(hard))
     print("\n== 总结 ==", flush=True)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "result.json"), "w", encoding="utf-8") as f:
-        json.dump({"model": args.model, "summary": summary, "detail": result},
+        json.dump({"model": args.model, "suite": args.suite, "summary": summary,
+                   "detail": result},
                   f, ensure_ascii=False, indent=2)
 
     meta = {"model": args.model, "base_url": args.base_url,
             "quant": args.quant or "Q5_K_M(推测,可改)", "ctx": args.ctx or "-",
             "machine": args.machine or "本机",
             "time": time.strftime("%Y-%m-%d %H:%M")}
-    md = gen_report_md(result, meta, summary)
+    if hard:
+        md = gen_hard_report_md(hard, meta, summary)
+    else:
+        md = gen_report_md(result, meta, summary)
     with open(os.path.join(args.out, "report.md"), "w", encoding="utf-8") as f:
         f.write(md)
     print("\n报告: %s/report.md  原始数据: %s/result.json" % (args.out, args.out), flush=True)

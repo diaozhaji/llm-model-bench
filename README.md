@@ -2,7 +2,11 @@
 
 本地 / 云端大模型快速评测工具。零依赖（仅 Python 标准库），支持任何 OpenAI 兼容端点（LM Studio、vLLM、ollama、one-api / new-api 网关等），自动兼容推理模型（输出 `reasoning_content` 思维链的模型，如 DeepSeek-R1、Qwen thinking 系列、gpt-oss 等）。
 
-## 评测内容（21 项，全部机器判分）
+## 评测内容
+
+两套题库，`--suite` 切换：
+
+### core 套件（21 项）
 
 | 维度 | 项数 | 内容与判分方式 |
 |---|---|---|
@@ -10,6 +14,19 @@
 | B Code | 5 | 写代码 ×3（隔离子进程单测自动验证）、找 bug ×1（bug 点识别 + 修复代码跑单测）、代码推理 ×1（与真实执行输出比对） |
 | C Agent | 3 | function calling 两轮工具调用（工具名/参数/回填推理）、json_schema 严格结构化输出、指令遵循 |
 | D 准确率 | 10 | 数学方程、百分比陷阱、逻辑推理、抽屉原理、数字比较、字母计数、数列规律、技术常识，唯一答案逐题 0/1 |
+
+### hard 套件（20 项，区分度版）
+
+面向 9B+ 模型饱和后的横向区分，全部真实执行判分：
+
+| 维度 | 项数 | 内容 |
+|---|---|---|
+| B+ 多语言代码 | 9 | Java ×4（Integer 缓存 `==`、ArrayList fail-fast CME 触发条件、LRU 缓存实现、`Map.merge` 语义）· Python ×3（闭包延迟绑定、asyncio 完成时序、类/实例属性继承链）· Node ×2（微任务/宏任务/nextTick 交错时序、var 闭包捕获） |
+| H 爬虫/HTML | 4 | HTML 表格结构化解析（属性提取+实体归一）、nginx 日志 URL 提取与解码、分页爬取编排（本地 mock HTTP server 真实请求）、链接发现与 URL 规范化（urljoin/去 fragment/同域过滤）——全部纯标准库 |
+| C+ 长 Agent | 4 | 五轮依赖工具链下单（状态跨轮保持）、工具报错与缺货降级（如实说明 vs 编造）、十轮指令保持（JSON+trace_id 约束漂移检测）、爬虫编排多轮抓取（404 处理与终止条件） |
+| D+ 难题 | 3 | 四人两轮说谎者（程序穷举唯一解）、行程追及、四段代码语义辨析 |
+
+Java/Node 题在本地真实编译运行判分（`javac`+`java` / `node`），需要本机装有 JDK 与 Node。
 
 采样统一 `temperature=0`（贪心解码），结果可复现。
 
@@ -36,6 +53,7 @@ python3 lm_model_bench.py --base-url https://gw.example.com/v1 \
 | 参数 | 说明 |
 |---|---|
 | `--model` | 模型 ID（必填） |
+| `--suite` | `core`（默认，21 项）/ `hard`（区分度 20 项）/ `all` |
 | `--base-url` | OpenAI 兼容端点，默认 `http://localhost:1234`；以 `/v1` 结尾自动拼接 `/chat/completions`，也支持直接传完整 `/chat/completions` 地址 |
 | `--max-tokens-override` | 覆盖能力题的 max_tokens 预算（推理模型建议 4096-8192） |
 | `--skip` | 逗号分隔跳过某维度：`speed,code,agent,qa` |
@@ -52,6 +70,7 @@ python3 lm_model_bench.py --base-url https://gw.example.com/v1 \
 2. 判分文本正文优先，为空时回退思维链；Code 题对回复中**所有代码块逐个验证取最优**，思维链中的草稿代码也能被正确计分。
 3. 个别 "thinking" 模型在本地引擎下思维链会**无限膨胀（重复退化）**：给多大预算吃多大、写重复内容、`content` 长期为空。遇到这种情况建议换量化版本或关闭 thinking，这不是脚本能修的。
 4. 速度测试对并发敏感：后台有其他请求时测出的 tok/s 会明显失真，测速请保证无负载。
+5. **判分器必须先自测**：每道题先用标准答案代码跑一遍判分器，确认判分器自身 100% 通过再测模型。本项目实测中，参考答案笔误（一道平均数题）与题目语义歧义（总价口径、query 前缀）都曾造成模型被集体误判——机器判分 ≠ 天然正确。`--suite hard` 的全部题库均已通过标准答案自测。
 
 ## 自定义题库
 
@@ -64,6 +83,14 @@ python3 lm_model_bench.py --base-url https://gw.example.com/v1 \
 ## 环境要求
 
 - Python 3.8+，无第三方依赖
+- hard 套件：Java 题需本机 `javac`/`java`（JDK 11+），Node 题需本机 `node`（14+）
 - 被测端点支持 OpenAI `/chat/completions` 协议；function calling 与 json_schema 测试要求端点支持 `tools` / `response_format`，不支持时会记录 error 而不是误判
+
+## 项目结构
+
+```
+lm_model_bench.py   # 主评测器：API 层、多语言执行器、core 套件、报告生成
+hard_tasks.py       # hard 套件题库：多语言代码题、爬虫题 fixture、长 Agent 场景、难题
+```
 
 > AI生成
