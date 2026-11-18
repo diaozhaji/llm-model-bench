@@ -15,16 +15,27 @@
 | C Agent | 3 | function calling 两轮工具调用（工具名/参数/回填推理）、json_schema 严格结构化输出、指令遵循 |
 | D 准确率 | 10 | 数学方程、百分比陷阱、逻辑推理、抽屉原理、数字比较、字母计数、数列规律、技术常识，唯一答案逐题 0/1 |
 
-### hard 套件（20 项，区分度版）
+### hard 套件（20 题，等权数题）
 
-面向 9B+ 模型饱和后的横向区分，全部真实执行判分：
+面向 9B+ 模型饱和后的横向区分，全部真实执行判分。
 
-| 维度 | 项数 | 内容 |
+**计分口径：一题的全部用例通过才算 1 道，总分直接是「通过题数 / 20」，不做加权、不换算百分制。**
+用例通过率只在报告里做诊断参考，不进总分。
+
+| 维度 | 题数 | 内容 |
 |---|---|---|
-| B+ 多语言代码 | 9 | Java ×4（Integer 缓存 `==`、ArrayList fail-fast CME 触发条件、LRU 缓存实现、`Map.merge` 语义）· Python ×3（闭包延迟绑定、asyncio 完成时序、类/实例属性继承链）· Node ×2（微任务/宏任务/nextTick 交错时序、var 闭包捕获） |
-| H 爬虫/HTML | 4 | HTML 表格结构化解析（属性提取+实体归一）、nginx 日志 URL 提取与解码、分页爬取编排（本地 mock HTTP server 真实请求）、链接发现与 URL 规范化（urljoin/去 fragment/同域过滤）——全部纯标准库 |
-| C+ 长 Agent | 4 | 五轮依赖工具链下单（状态跨轮保持）、工具报错与缺货降级（如实说明 vs 编造）、十轮指令保持（JSON+trace_id 约束漂移检测）、爬虫编排多轮抓取（404 处理与终止条件） |
-| D+ 难题 | 3 | 四人两轮说谎者（程序穷举唯一解）、行程追及、四段代码语义辨析 |
+| B+ 多语言代码 | 9 | Java ×4（Integer 缓存 `==`、ArrayList fail-fast CME、LRU 缓存、`Map.merge` 语义）· Python ×3（闭包延迟绑定、asyncio 完成时序、类/实例属性继承链）· Node ×2（微任务/宏任务/nextTick 交错、var 闭包捕获） |
+| H 爬虫/HTML | 4 | 表格结构化解析（实体解码 `&amp;`+残行跳过）、nginx 日志（URL 解码 + IPv6 行 + 不可解析行）、分页爬取（mock server 真实 HTTP，`crawl_all(base)` 契约）、链接规范化（urljoin/去 fragment/同域过滤） |
+| C+ 长 Agent | 4 | 五轮依赖工具链下单、工具报错与缺货降级（实体断言防编造）、十轮指令保持（每轮答复写回对话 + 全程 80% 保持率）、爬虫编排（404 处理 + 外域跳过校验） |
+| D+ 难题 | 3 | 正则手机号提取（分段归一）、行程追及、四段代码输出预测（严格单行答案，机器可判） |
+
+难度分为基础 / 中等 / 难三档（仅作报告分档展示，不参与计分）：
+
+| 档 | 题号 |
+|---|---|
+| 基础 | J1 P1 N2 J4 D2 |
+| 中等 | J2 P2 N1 H1 H2 H3 A4 A5 P3 |
+| 难 | J3 H4 A6 A7 D1 D3 |
 
 Java/Node 题在本地真实编译运行判分（`javac`+`java` / `node`），需要本机装有 JDK 与 Node。
 
@@ -35,6 +46,9 @@ Java/Node 题在本地真实编译运行判分（`javac`+`java` / `node`），�
 本地 LM Studio（默认 `http://localhost:1234`）：
 
 ```bash
+# 先自测判分器(不需要 API/模型), 全绿再开跑
+python3 lm_model_bench.py --selftest
+
 python3 lm_model_bench.py --model <模型ID> --max-tokens-override 8192
 ```
 
@@ -57,6 +71,7 @@ python3 lm_model_bench.py --base-url https://gw.example.com/v1 \
 | `--base-url` | OpenAI 兼容端点，默认 `http://localhost:1234`；以 `/v1` 结尾自动拼接 `/chat/completions`，也支持直接传完整 `/chat/completions` 地址 |
 | `--max-tokens-override` | 覆盖能力题的 max_tokens 预算（推理模型建议 4096-8192） |
 | `--skip` | 逗号分隔跳过某维度：`speed,code,agent,qa` |
+| `--selftest` | 只跑判分器自测：用参考答案验证 20 道题的判分器是否 100% 通过（不需要 API） |
 | `--timeout` | 单请求超时秒数，默认 420 |
 | `--api-key` / `BENCH_API_KEY` | 鉴权 key，推荐用环境变量 |
 | `--out` | 输出目录，默认 `.temp/bench` |
@@ -70,7 +85,7 @@ python3 lm_model_bench.py --base-url https://gw.example.com/v1 \
 2. 判分文本正文优先，为空时回退思维链；Code 题对回复中**所有代码块逐个验证取最优**，思维链中的草稿代码也能被正确计分。
 3. 个别 "thinking" 模型在本地引擎下思维链会**无限膨胀（重复退化）**：给多大预算吃多大、写重复内容、`content` 长期为空。遇到这种情况建议换量化版本或关闭 thinking，这不是脚本能修的。
 4. 速度测试对并发敏感：后台有其他请求时测出的 tok/s 会明显失真，测速请保证无负载。
-5. **判分器必须先自测**：每道题先用标准答案代码跑一遍判分器，确认判分器自身 100% 通过再测模型。本项目实测中，参考答案笔误（一道平均数题）与题目语义歧义（总价口径、query 前缀）都曾造成模型被集体误判——机器判分 ≠ 天然正确。`--suite hard` 的全部题库均已通过标准答案自测。
+5. **判分器必须先自测**：`python3 lm_model_bench.py --selftest` 用参考答案把 20 道题的判分器全跑一遍，并带反向用例（错误答案必须被判错），全绿再测模型。本项目真实踩过的坑：参考答案笔误导致四个模型被集体误判、H3 题面说 `crawl_all(base)` 但评测器传的是完整入口 URL（越按题面写分越低）、Java 一个用例抛异常会把前面已通过的用例一起清零。机器判分 ≠ 天然正确。
 
 ## 自定义题库
 
@@ -90,7 +105,8 @@ python3 lm_model_bench.py --base-url https://gw.example.com/v1 \
 
 ```
 lm_model_bench.py   # 主评测器：API 层、多语言执行器、core 套件、报告生成
-hard_tasks.py       # hard 套件题库：多语言代码题、爬虫题 fixture、长 Agent 场景、难题
+hard_tasks.py       # hard 套件题库：多语言代码题、爬虫题 fixture、长 Agent 场景、难题、难度档
+selftest.py         # 判分器自测：20 题参考答案 + 反向用例（--selftest 调用）
 ```
 
 > AI生成

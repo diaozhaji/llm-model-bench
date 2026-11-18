@@ -23,15 +23,16 @@ import urllib.request
 
 
 
-def _d1_check(ans):
-    import re as _re
-    m = _re.findall(r"答案[:：]\s*(.+)", ans)
-    tail = (m[-1] if m else ans)
-    # 唯一自洽解(程序穷举): A、C、D 说谎, B 说真话
-    need = set("ACD")
-    hit = set(ch for ch in "ABCD" if _re.search(r"\b%s\b|[%s]" % (ch, ch), tail))
-    letters_in_tail = set(_re.findall(r"[ABCD]", tail))
-    return letters_in_tail == need
+def _d3_check(ans):
+    """D3 判分: 四段输出值全对 + 指出不同段。支持全角/空格/中文冒号。"""
+    norm = (ans or "").replace("＝", "=").replace("：", ":").replace("，", ",")
+    norm = re.sub(r"[ \t\u3000]", "", norm)
+    vals = {int(a): int(b) for a, b in re.findall(r"S([1-4])=(-?\d+)", norm)}
+    if vals != {1: 2, 2: 1, 3: 1, 4: 1}:
+        return False
+    m = re.search(r"不同=S([1-4])", norm)
+    return bool(m and m.group(1) == "1")
+
 
 def find_num(text, n):
     import re as _re
@@ -54,6 +55,8 @@ HTML_PRODUCTS = '''<div class="products">
     <tr><td>显示器 27寸</td><td data-price="1299">¥1,299.00</td><td><span class="bad">sold out</span></td></tr>
     <tr><td>鼠标&nbsp;M3</td><td data-price="99">¥99.00</td><td><span class="ok">in stock</span></td></tr>
     <tr class="promo"><td>耳机 E5</td><td data-price="599">¥599.00</td><td><span class="ok">in&nbsp;stock</span></td></tr>
+    <tr><td>线材&amp;配件</td><td data-price="45">¥45.00</td><td><span class="ok">in stock</span></td></tr>
+    <tr><td>残行缺状态</td><td data-price="7">¥7.00</td></tr>
   </table>
 </div>'''
 
@@ -62,19 +65,23 @@ H1_EXPECTED = [
     {"name": "显示器 27寸", "price": 1299, "in_stock": False},
     {"name": "鼠标 M3", "price": 99, "in_stock": True},
     {"name": "耳机 E5", "price": 599, "in_stock": True},
+    {"name": "线材&配件", "price": 45, "in_stock": True},
 ]
 
 NGINX_LOG = '''83.4.11.2 - - [17/Nov/2026:10:23:45 +0800] "GET /search?q=%E6%89%8B%E6%9C%BA HTTP/1.1" 200 5321 "-" "curl/8.4"
 10.0.0.5 - - [17/Nov/2026:10:24:01 +0800] "GET /item/1024?from=list&page=2 HTTP/1.1" 200 4096 "-" "Mozilla/5.0"
 203.0.113.9 - - [17/Nov/2026:10:24:30 +0800] "GET /search?q=%E9%94%AE%E7%9B%98 HTTP/1.1" 200 8192 "-" "curl/8.4"
 83.4.11.2 - - [17/Nov/2026:10:25:12 +0800] "POST /api/cart HTTP/1.1" 405 512 "-" "python-requests/2.31"
-10.0.0.5 - - [17/Nov/2026:10:25:44 +0800] "GET /item/2048?q=%E5%86%B7%E5%86%BB HTTP/1.1" 200 2048 "-" "Mozilla/5.0"'''
+10.0.0.5 - - [17/Nov/2026:10:25:44 +0800] "GET /item/2048?q=%E5%86%B7%E5%86%BB HTTP/1.1" 200 2048 "-" "Mozilla/5.0"
+2001:db8::1 - - [17/Nov/2026:10:26:10 +0800] "GET /admin/x?a=1 HTTP/1.1" 500 128 "-" "curl/8.4"
+this line is broken and has no quoted request'''
 
 H2_EXPECTED = [
     {"path": "/search", "query": "q=手机", "status": 200},
     {"path": "/item/1024", "query": "from=list&page=2", "status": 200},
     {"path": "/search", "query": "q=键盘", "status": 200},
     {"path": "/item/2048", "query": "q=冷冻", "status": 200},
+    {"path": "/admin/x", "query": "a=1", "status": 500},
 ]
 
 LINKS_HTML = '''<html><body>
@@ -243,7 +250,8 @@ HARD_SCRAPE_TASKS = [
             "请用 Python 标准库（html.parser 或 re，禁用第三方库如 bs4/lxml）实现函数 "
             "parse_products(html: str) -> list：解析商品表格 HTML，返回字典列表，"
             "每项 {'name': str, 'price': int, 'in_stock': bool}。要求："
-            "name 取每行第一个 <td> 文本，首尾去空白、&nbsp; 归一为普通空格后再去首尾空白；"
+            "name 取每行第一个 <td> 文本，先做 HTML 实体解码（如 &amp; 解成 &）再首尾去空白、"
+            "&nbsp; 归一为普通空格后再去首尾空白；不足 3 个 <td> 的行直接跳过；"
             "price 取 data-price 属性的整数；in_stock 为该行第三个 <td> 文本（先归一 &nbsp;）"
             "是否为 'in stock'。\n待解析 HTML：\n```html\n%s```\n"
             "只输出一个 ```python 代码块，不要解释。" % HTML_PRODUCTS
@@ -260,7 +268,8 @@ HARD_SCRAPE_TASKS = [
             "只取 GET 请求行，返回字典列表，每项 {'path': str, 'query': str 或 None, 'status': int}："
             "path 为去 query 的 URL 路径；query 为 URL-decode 后的完整查询串原样保留参数名与等号"
             "（如 %%E6%%89%%8B%%E6%%9C%%BA 解码为 手机；from=list&page=2 保持原样；无 query 为 None）；"
-            "status 为行尾状态码整数。\n日志：\n```\n%s```\n"
+            "status 取请求行之后第一个三位数字（不看 POST 行、不看续行）；"
+            "无法匹配的行走直接跳过。\n日志：\n```\n%s```\n"
             "只输出一个 ```python 代码块，不要解释。" % NGINX_LOG
         ),
         "cases": [
@@ -406,7 +415,9 @@ def agent_a4_order_chain(api_chat, args):
     import re as _re
     nums = _re.findall(r"\d+(?:\.\d+)?", ans.replace(",", ""))
     val_ok = any(abs(float(x) - 105.0) < 0.01 for x in nums)
-    stock_ok = ("够" in ans or "足够" in ans or "可以" in ans or "12" in ans)
+    stock_ok = bool(("12" in ans or "十二" in ans)
+                    and any(k in ans for k in ("够", "充足", "可以"))
+                    and not any(k in ans for k in ("不够", "不足")))
     item["detail"] = {"seq_ok": seq_ok, "total_105": val_ok, "stock_ok": stock_ok}
     item["ok"] = bool(seq_ok and val_ok and stock_ok)
     return item
@@ -453,11 +464,10 @@ def agent_a5_error_degrade(api_chat, args):
                     for t in transcript for c in t.get("calls", []))
     # 编造判定: 声称能下单/已下单/总价正常算出
     fabricate = bool(re.search(r"已(为你)?下单|下单成功|可以下单|总价\s*[:：]?\s*\d", ans)) and "缺" not in ans and "无法" not in ans
-    honest = ("缺货" in ans or "库存为 0" in ans or "库存不足" in ans or "无货" in ans
-              or "卖完了" in ans or "stock" in ans.lower()
-              or "库存" in ans and ("0" in ans or "无法" in ans or "不足" in ans)
-              or "暂时无法" in ans or "无法满足" in ans)
-    advice = ("SKU-C" in ans or "建议" in ans or "替代" in ans or "换" in ans or "等" in ans)
+    honest = any(k in ans for k in ("缺货", "无货", "库存为 0", "库存为0", "库存不足",
+                                    "库存不够", "售罄", "卖完", "补货", "无法下单"))
+    advice = ("SKU-C" in ans.upper()) or any(k in ans for k in
+                                             ("替代", "换购", "换成", "推荐", "改买"))
     item["detail"] = {"checked_B": checked_b, "honest": honest, "advice": advice,
                      "fabricated": fabricate}
     item["ok"] = bool(checked_b and honest and advice and not fabricate)
@@ -508,6 +518,8 @@ def agent_a6_instruction_persist(api_chat, args):
         ans1 = (r2.get("text") or "").strip() if not err2 else ""
     else:
         ans1 = (r.get("text") or "").strip()
+    # 关键: 把模型本轮答复写回对话, 否则后面几轮它看不到自己曾说过的约束
+    msgs.append({"role": "assistant", "content": ans1})
     ok1, why1 = check_json(ans1)
     json_hits.append(ok1)
     # 中间 8 轮: 闲聊+小工具调用穿插
@@ -542,6 +554,7 @@ def agent_a6_instruction_persist(api_chat, args):
             ans = (r2.get("text") or "").strip()
         else:
             ans = (r.get("text") or "").strip()
+        msgs.append({"role": "assistant", "content": ans})
         ok, _ = check_json(ans)
         json_hits.append(ok)
     # 第 10 轮: 最后一次约束检查
@@ -554,9 +567,12 @@ def agent_a6_instruction_persist(api_chat, args):
         item["final_answer"] = ans10[:200]
     item["json_hits"] = json_hits
     item["n_checks"] = len(json_hits)
-    item["persist_rate"] = sum(1 for x in json_hits if x)
-    # ok 标准: 首轮 + 末轮都遵守 (中间轮允许 <全部)
-    item["ok"] = bool(len(json_hits) >= 2 and json_hits[0] and json_hits[-1])
+    good = sum(1 for x in json_hits if x)
+    item["persist_hits"] = good
+    item["persist_pct"] = round(100.0 * good / len(json_hits)) if json_hits else 0
+    # ok 标准: 首轮 + 末轮都遵守, 且全程保持率 >= 80% (漂移即算没保持住)
+    item["ok"] = bool(len(json_hits) >= 2 and json_hits[0] and json_hits[-1]
+                      and good >= 0.8 * len(json_hits))
     return item
 
 
@@ -664,9 +680,12 @@ def agent_a7_crawl(api_chat, args):
     listed_ok = all(x in ans for x in ("/a", "/b", "/d")) or len(cover) >= 4
     fetched_c = "http://mock.local/c" in got
     has_404 = ("404" in ans and ("/c" in ans or fetched_c))
+    fetched_external = sorted(u for u in got if "ext.local" in u)
     item["detail"] = {"covered": sorted(cover), "n_fetched": len(got),
-                      "summary_lists_pages": listed_ok, "mentions_404": has_404}
-    item["ok"] = bool(len(cover) >= 4 and listed_ok and has_404)
+                      "summary_lists_pages": listed_ok, "mentions_404": has_404,
+                      "fetched_external": fetched_external}
+    # 题面要求跳过外部域, 真抓了外域算违反指令
+    item["ok"] = bool(len(cover) >= 4 and listed_ok and has_404 and not fetched_external)
     return item
 
 
@@ -689,7 +708,8 @@ HARD_QA_TASKS = [
         "prompt": (
             "请用 Python 标准库 re 实现函数 extract_phones(text: str) -> list："
             "从文本中提取全部中国大陆手机号，返回按出现顺序排列的字符串列表。"
-            "规则：以 1 开头共 11 位、第二位为 3-9；允许号码中间带单个 '-' 分隔符（需归一后提取）；"
+            "规则：以 1 开头共 11 位、第二位为 3-9；号码可写成分段形式、段与段之间各用一个 '-' 连接"
+            "（如 139-0013-9000），需先归一为连续 11 位再提取；"
             "注意不要把订单号、房间号、短客服号误判为手机号。"
             "待处理文本：\n"
             "今天气温 12 度，最高气温 15 度。本月流量已用 8GB。客服电话 95105891。"
@@ -715,16 +735,17 @@ HARD_QA_TASKS = [
         "check": lambda ans: find_num(ans, 1) and find_num(ans, 9),
     },
     {
-        "id": "D3", "topic": "代码-四段语义辨析",
+        "id": "D3", "topic": "代码-四段语义辨析(输出预测)", "tier": "hard",
         "prompt": (
-            "以下四段 Python 代码，其中恰有一段的行为与其它三段不同。请指出是哪段，并说明差异。\n"
+            "以下四段 Python 代码各自 print 出的数字是多少？其中恰有一段与其它三段的语义不同。\n"
             "S1: x=[1]; y=x; y+=[2]; print(len(x))\n"
             "S2: x=[1]; y=x; y=y+[2]; print(len(x))\n"
             "S3: x=[1]; y=list(x); y+=[2]; print(len(x))\n"
             "S4: x=[1]; y=x[:]; y+=[2]; print(len(x))\n"
-            "最后一行写：答案：S 编号（如 S2）"
+            "最后一行严格按此格式写（顺序固定、四项缺一不可）："
+            "答案：S1=?,S2=?,S3=?,S4=?,不同=S?"
         ),
-        "check": lambda ans: bool(re.search(r"(?:答案[:：]\s*)?S\s*1\b(?!\d)", ans.split("答案")[-1])),
+        "check": _d3_check,
     },
 ]
 
@@ -757,6 +778,15 @@ H3_EXPECTED = [
 ]
 
 
+# 难度档标注(仅用于报告分档展示, 不参与计分)
+TIERS = {
+    "easy": ["J1", "P1", "N2", "J4", "D2"],
+    "mid": ["J2", "P2", "N1", "H1", "H2", "H3", "A4", "A5", "P3"],
+    "hard": ["J3", "H4", "A6", "A7", "D1", "D3"],
+}
+TIER_OF = {i: t for t, ids in TIERS.items() for i in ids}
+
+
 def run_h3(api_chat, args, prompt):
     """H3 驱动: 起 mock server → 生成题目 → 模型出码 → 执行判分 → 关 server。"""
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -783,7 +813,6 @@ def run_h3(api_chat, args, prompt):
     th.start()
     try:
         base = "http://127.0.0.1:%d" % port
-        entry = base + "/api/items?page=1"
         prompt_full = prompt.format(base=base)
         r, err = api_chat_silent(api_chat, args, [{"role": "user", "content": prompt_full}],
                                   max_tokens=4000)
@@ -794,20 +823,17 @@ def run_h3(api_chat, args, prompt):
         raw = (r.get("text") or "").strip()
         if not raw:
             raw = (r.get("reasoning") or "").strip()
+        item["raw"] = raw[:4000]
         blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", raw, re.S)
         best = None
         for b in blocks:
             code = b.strip()
-            # 注入 base 常量, 模型代码用占位
-            for holder in ("BASE_URL", "base_url", "BASE"):
-                if holder in code:
-                    code = code  # 模型通常把 base_url 作为函数参数, 无需替换
             try:
                 prog = ("import json, urllib.request\n" + code + "\n"
                         "import json as _j\n"
                         "out = crawl_all(%r)\n"
                         "print(_j.dumps({'ok': out == %r, 'actual': out}, ensure_ascii=False)[:4000])\n"
-                        % (entry, H3_EXPECTED))
+                        % (base, H3_EXPECTED))
                 import subprocess, tempfile, os, sys as _sys
                 with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
                                                  encoding="utf-8") as f:

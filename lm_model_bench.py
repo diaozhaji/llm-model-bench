@@ -119,13 +119,31 @@ def api_chat(base_url, model, messages, max_tokens=512, temperature=0.0,
             "gen_tokens": gen_toks}
 
 
+def _is_infra(err):
+    """判断是否为基础设施错误(值得重试, 且不该记成模型失败)。"""
+    e = err or ""
+    m = re.match(r"HTTP (\d{3})", e)
+    if m:
+        return int(m.group(1)) >= 500 or int(m.group(1)) == 429
+    return any(k in e for k in ("URLError", "timed out", "timeout", "TimeoutError",
+                                "Connection reset", "ConnectionReset", "RemoteDisconnected",
+                                "Connection refused", "ConnectionRefused", "SSL", "ssl"))
+
+
 def safe_call(fn, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs), None
-    except urllib.error.HTTPError as e:
-        return None, "HTTP %d: %s" % (e.code, e.read().decode("utf-8", "ignore")[:300])
-    except Exception as e:
-        return None, "%s: %s" % (type(e).__name__, e)
+    """带重试的调用: 基础设施错误最多试 3 次(1s/2s 退避), 仍失败则打 INFRA 标。"""
+    last = None
+    for attempt in range(3):
+        try:
+            return fn(*args, **kwargs), None
+        except urllib.error.HTTPError as e:
+            last = "HTTP %d: %s" % (e.code, e.read().decode("utf-8", "ignore")[:300])
+        except Exception as e:
+            last = "%s: %s" % (type(e).__name__, e)
+        if not _is_infra(last) or attempt == 2:
+            break
+        time.sleep(2 ** attempt)
+    return None, ("INFRA: " + last) if _is_infra(last) else last
 
 # ============================================================ 工具: 代码提取与本地验证
 
@@ -174,13 +192,32 @@ def run_tests(code, cases, timeout=15):
 
 # ============================================================ 答案提取
 
+ANSWER_PAT = re.compile(r"(?:最终答案|答案|结论|综上|答)\s*[:：]\s*(.+)")
+
+
 def extract_answer(text):
-    """提取最后一行『答案：xxx / 答案: xxx』内容; 找不到就取最后一行。"""
-    matches = re.findall(r"答案[:：]\s*(.+)", text)
+    """提取答案行: 支持 答案/答/结论/最终答案/综上 五种前缀, 去掉 markdown 修饰。
+    找不到前缀时回退最后一行。"""
+    t = (text or "").strip()
+    # 先去 markdown 修饰, 否则 "**最终答案**：9" 匹配不上前缀
+    t = t.replace("**", "").replace("`", "")
+    matches = ANSWER_PAT.findall(t)
     if matches:
-        return matches[-1].strip()
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    return lines[-1] if lines else text.strip()
+        line = matches[-1].strip()
+    else:
+        lines = [l.strip() for l in t.splitlines() if l.strip()]
+        line = lines[-1] if lines else t
+    return line.strip("*`_ >").strip()
+
+
+def _pair_check(ans, name_a, val_a, name_b, val_b):
+    """名值配对校验: 「苹果 6 斤，香蕉 14 斤」通过, 「苹果 14 斤，香蕉 6 斤」不通过。"""
+    def grab(name):
+        m = re.search(name + r"[^0-9]{0,10}(\d+(?:\.\d+)?)", ans)
+        return float(m.group(1)) if m else None
+    a, b = grab(name_a), grab(name_b)
+    return (a is not None and b is not None
+            and abs(a - val_a) < 1e-9 and abs(b - val_b) < 1e-9)
 
 
 def find_num(text, n):
@@ -215,13 +252,21 @@ def run_java_tests(code, cases, timeout=30):
     results, fails = 0, []
     d = tempfile.mkdtemp(prefix="jbench_")
     try:
-        harness = (
-            "public class Harness {\n"
-            "  public static void main(String[] a) throws Exception {\n"
-            "    %s\n"
-            "  }\n"
-            "}\n" % "\n    ".join("{\n      %s\n    }" % c for c in cases)
-        )
+        # 每个用例独立 try/catch: 某个用例抛异常不再抹掉前面已 PASS 的用例
+        blocks = []
+        for i, c in enumerate(cases):
+            blocks.append(
+                "    {\n"
+                "      try {\n"
+                "        " + c + "\n"
+                "      } catch (Throwable t) {\n"
+                '        System.out.println("CASE FAIL c' + str(i) + ' " + t.getClass().getSimpleName());\n'
+                "      }\n"
+                "    }")
+        harness = ("public class Harness {\n"
+                   "  public static void main(String[] a) throws Exception {\n"
+                   + "\n".join(blocks) +
+                   "\n  }\n}\n")
         src = code + "\n" + harness
         src_path = os.path.join(d, "Harness.java")
         # 去掉可能的 package 声明
@@ -234,16 +279,17 @@ def run_java_tests(code, cases, timeout=30):
         if rc != 0:
             return 0, len(cases), ["javac 编译失败: %s" % err.splitlines()[-1][:180] if err else "?"]
         rc, out, err = _run_cmd(["java", "-cp", ".", "Harness"], d, timeout)
-        if rc != 0:
-            return 0, len(cases), ["运行失败: %s" % (err.splitlines()[-1][:180] if err else "?")]
-        for line in out.splitlines():
-            if line.startswith("CASE "):
-                if line.startswith("CASE PASS"):
-                    results += 1
-                else:
-                    fails.append(line[:180])
-        # 缺失的用例按失败计
         reported = sum(1 for l in out.splitlines() if l.startswith("CASE "))
+        # 一个用例结果都没输出(启动即崩/超时)才算整体运行失败
+        if rc != 0 and reported == 0:
+            tail = (err or out).strip().splitlines()
+            return 0, len(cases), ["运行失败: %s" % (tail[-1][:180] if tail else "?")]
+        for line in out.splitlines():
+            if line.startswith("CASE PASS"):
+                results += 1
+            elif line.startswith("CASE FAIL"):
+                fails.append(line[:180])
+        # 缺失的用例按失败计(超时/进程被杀时可能只剩前几条)
         if reported < len(cases):
             fails.append("仅输出了 %d/%d 个用例结果" % (reported, len(cases)))
         return results, len(cases), fails
@@ -414,7 +460,7 @@ QA_TASKS = [
         "id": "Q1", "topic": "数学-方程",
         "prompt": ("苹果每斤 3 元，香蕉每斤 5 元。用 88 元恰好买 20 斤水果，且香蕉不少于苹果。"
                    "求苹果和香蕉各多少斤。一步步推理，最后一行写：答案：苹果 X 斤，香蕉 Y 斤"),
-        "check": lambda ans: find_num(ans, 6) and find_num(ans, 14),
+        "check": lambda ans: _pair_check(ans, "苹果", 6, "香蕉", 14),
     },
     {
         "id": "Q2", "topic": "数学-百分比陷阱",
@@ -900,7 +946,7 @@ def bench_hard(args):
         if best is None:
             best = (0, len(task["cases"]), ["未找到代码块"])
         item.update({"passed": best[0], "total": best[1], "ok": best[0] == best[1],
-                     "fails": best[2], "n_code_blocks": len(blocks)})
+                     "fails": best[2], "n_code_blocks": len(blocks), "raw": raw[:4000]})
         out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
 
     # --- H 爬虫/HTML 静态题 ---
@@ -928,7 +974,7 @@ def bench_hard(args):
         if best is None:
             best = (0, len(task["cases"]), ["未找到代码块"])
         item.update({"passed": best[0], "total": best[1], "ok": best[0] == best[1],
-                     "fails": best[2], "n_code_blocks": len(blocks)})
+                     "fails": best[2], "n_code_blocks": len(blocks), "raw": raw[:4000]})
         out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
 
     # --- H3 分页爬取（mock server 真实 HTTP） ---
@@ -972,84 +1018,140 @@ def bench_hard(args):
             ans = extract_answer(answer_text(r))
             item["answer_line"] = ans[:60]
             item["ok"] = bool(task["check"](ans))
+        item["raw"] = answer_text(r)[:4000]
         out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
+    # 难度档标注(仅展示) + infra 错误标记
+    for x in out:
+        x.setdefault("tier", ht.TIER_OF.get(x["id"], "-"))
+        if str(x.get("error") or "").startswith("INFRA:"):
+            x["infra"] = True
     return out
 
 
+GROUP_LABELS = (("hard_code", "代码 B+ (9 题)"), ("hard_scrape", "爬虫 H (4 题)"),
+                 ("hard_agent", "Agent C+ (4 题)"), ("hard_puzzle", "难题 D+ (3 题)"))
+TIER_LABELS = {"easy": "基础", "mid": "中等", "hard": "难", "-": "-"}
+
+
+def _group_of(iid):
+    if iid[0] in "JPN":
+        return "code"
+    return {"H": "scrape", "A": "agent"}.get(iid[0], "puzzle")
+
+
 def summarize_hard(hard):
+    """20 题等权: 一道题全部用例通过才算 1 道, 总分直接是 X/20(不做加权/百分制)。"""
     if not hard:
         return {}
-    passed = sum(x.get("passed", 1 if x.get("ok") else 0) for x in hard)
-    total = sum(x.get("total", 1) for x in hard)
-    s = {"hard": "%d/%d" % (passed, total),
-         "hard_pct": "%.0f%%" % (100.0 * passed / total if total else 0)}
+    n = len(hard)
+    passed = sum(1 for x in hard if x.get("ok"))
+    s = {"hard": "%d/%d" % (passed, n),
+         "hard_pct": "%.0f%%" % (100.0 * passed / n),
+         "hard_cases": "%d/%d" % (sum(x.get("passed", 1 if x.get("ok") else 0) for x in hard),
+                                  sum(x.get("total", 1) for x in hard)),
+         "hard_errors": sum(1 for x in hard if x.get("infra"))}
     groups = {}
     for x in hard:
-        gid = x["id"][0]
-        if gid in "JPN":
-            g = "code"
-        elif gid == "H":
-            g = "scrape"
-        elif gid == "A":
-            g = "agent"
-        else:
-            g = "puzzle"
-        p = x.get("passed", 1 if x.get("ok") else 0)
-        t = x.get("total", 1)
+        g = _group_of(x["id"])
         groups.setdefault(g, [0, 0])
-        groups[g][0] += p
-        groups[g][1] += t
+        groups[g][0] += 1 if x.get("ok") else 0
+        groups[g][1] += 1
     for g, (p, t) in groups.items():
         s["hard_" + g] = "%d/%d" % (p, t)
     return s
 
 
 def gen_hard_report_md(hard, meta, summary):
+    """报告口径: X/20 等权数题, 不换算百分制、不加权。"""
     L = []
-    L.append("# LLM 模型评测报告（hard 区分度套件）")
+    L.append("# LLM 模型评测报告（hard 套件 20 题）")
     L.append("")
     L.append("- **被测模型**：%s" % meta["model"])
     L.append("- **端点**：%s" % meta["base_url"])
     L.append("- **机器**：%s" % meta.get("machine"))
     L.append("- **测试时间**：%s" % meta.get("time"))
     L.append("- **采样**：temperature=0（贪心解码，结果可复现）")
+    L.append("- **判分口径**：一道题的全部用例通过才算 1 道；总分 = 通过题数 / 总题数，不加权")
+    if meta.get("task_hash"):
+        L.append("- **题库版本**：`%s`（只可与同版本结果对比）" % meta["task_hash"])
     L.append("")
     L.append("## 总分")
     L.append("")
-    L.append("| 指标 | 结果 |")
+    L.append("### %s" % summary.get("hard", "-"))
+    L.append("")
+    L.append("| 维度 | 通过 |")
     L.append("|---|---|")
-    L.append("| hard 总分（20 项判分点） | %s |" % summary.get("hard"))
-    for k in ("hard_code", "hard_scrape", "hard_agent", "hard_puzzle"):
+    for k, label in GROUP_LABELS:
         if k in summary:
-            names = {"hard_code": "B+ 多语言代码 (9 题)", "hard_scrape": "H 爬虫/HTML (4 题)",
-                     "hard_agent": "C+ 长 Agent (4 题)", "hard_puzzle": "D+ 难题 (3 题)"}
-            L.append("| %s | %s |" % (names[k], summary[k]))
+            L.append("| %s | %s |" % (label, summary[k]))
+    if summary.get("hard_cases"):
+        L.append("")
+        L.append("> 用例级参考：%s（仅诊断用，不计入总分）" % summary["hard_cases"])
+    by_tier = {}
+    for x in hard:
+        t = x.get("tier", "-")
+        by_tier.setdefault(t, [0, 0])
+        by_tier[t][0] += 1 if x.get("ok") else 0
+        by_tier[t][1] += 1
+    if by_tier:
+        L.append("")
+        L.append("| 难度档 | 通过 |")
+        L.append("|---|---|")
+        for t in ("easy", "mid", "hard", "-"):
+            if t in by_tier:
+                L.append("| %s | %d/%d |" % (TIER_LABELS.get(t, t), by_tier[t][0], by_tier[t][1]))
+    errs = [x["id"] for x in hard if x.get("infra")]
+    if errs:
+        L.append("")
+        L.append("> ⚠️ %d 道为 ERROR（超时/5xx，已重试仍失败），按未通过计：%s。建议重跑确认。"
+                 % (len(errs), "、".join(errs)))
     L.append("")
     L.append("## 逐项明细")
     L.append("")
-    L.append("| 题号 | 题目 | 结果 | 判分/说明 |")
-    L.append("|---|---|---|---|")
+    L.append("| 题号 | 难度 | 题目 | 结果 | 说明 |")
+    L.append("|---|---|---|---|---|")
     for x in hard:
-        if x.get("error"):
-            note = x["error"][:120]
-        elif x["id"].startswith("A"):
-            note = json.dumps(x.get("detail", {}), ensure_ascii=False)[:150]
-        elif x.get("fails"):
-            note = "; ".join(x["fails"])[:150]
+        t = x.get("tier", "-")
+        if x.get("infra"):
+            res = "⚠️ ERROR"
+        elif x.get("ok"):
+            res = "✅"
         else:
-            note = x.get("answer_line", "")[:60] or "✓"
-        passed = x.get("passed", 1 if x.get("ok") else 0)
-        total = x.get("total", 1)
-        score = "✅" if x.get("ok") else ("❌" if total == 1 else "❌ %d/%d" % (passed, total))
-        L.append("| %s | %s | %s | %s |" % (x["id"], x.get("name") or x.get("topic", ""), score, note))
+            p, tt = x.get("passed"), x.get("total")
+            res = "❌ %d/%d 用例" % (p, tt) if (p is not None and tt) else "❌"
+        if x.get("error"):
+            note = x["error"][:110]
+        elif x.get("fails"):
+            note = "; ".join(x["fails"])[:140]
+        elif x.get("answer_line"):
+            note = x["answer_line"][:60]
+        elif x.get("detail"):
+            note = json.dumps(x["detail"], ensure_ascii=False)[:140]
+        else:
+            note = "✓"
+        L.append("| %s | %s | %s | %s | %s |"
+                 % (x["id"], TIER_LABELS.get(t, t), x.get("name") or x.get("topic", ""), res, note))
     L.append("")
     return "\n".join(L)
+
+
+SCHEMA = "hard-item-v2"   # 计分口径版本: v2 = 20 题等权数题(X/20)
+
+
+def task_hash():
+    """题库指纹: 结果只与同指纹的题库结果可比。"""
+    import hashlib
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hard_tasks.py")
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()[:12]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://localhost:1234")
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", default="", help="模型 ID（--selftest 时可省略）")
     ap.add_argument("--out", default=".temp/bench")
     ap.add_argument("--quant", default="")
     ap.add_argument("--ctx", default="")
@@ -1061,8 +1163,16 @@ def main():
     ap.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", ""),
                     help="API key（建议经 BENCH_API_KEY 环境变量传入）")
     ap.add_argument("--suite", default="core", choices=["core", "hard", "all"],
-                    help="core=原 21 项；hard=区分度 20 项；all=两者都跑")
+                    help="core=原 21 项；hard=20 题等权套件；all=两者都跑")
+    ap.add_argument("--selftest", action="store_true",
+                    help="只跑判分器自测: 用参考答案验证 20 道题的判分器是否 100%% 通过")
     args = ap.parse_args()
+
+    if args.selftest:
+        import selftest
+        sys.exit(0 if selftest.run() else 1)
+    if not args.model:
+        ap.error("--model 必填（除非使用 --selftest）")
 
     skip = set(s.strip() for s in args.skip.split(",") if s.strip())
     result = {}
@@ -1088,14 +1198,15 @@ def main():
     print(json.dumps(summary, ensure_ascii=False), flush=True)
 
     os.makedirs(args.out, exist_ok=True)
+    th = task_hash()
     with open(os.path.join(args.out, "result.json"), "w", encoding="utf-8") as f:
-        json.dump({"model": args.model, "suite": args.suite, "summary": summary,
-                   "detail": result},
+        json.dump({"schema": SCHEMA, "task_hash": th, "model": args.model,
+                   "suite": args.suite, "summary": summary, "detail": result},
                   f, ensure_ascii=False, indent=2)
 
     meta = {"model": args.model, "base_url": args.base_url,
             "quant": args.quant or "Q5_K_M(推测,可改)", "ctx": args.ctx or "-",
-            "machine": args.machine or "本机",
+            "machine": args.machine or "本机", "task_hash": th,
             "time": time.strftime("%Y-%m-%d %H:%M")}
     if hard:
         md = gen_hard_report_md(hard, meta, summary)
