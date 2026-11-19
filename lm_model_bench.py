@@ -145,6 +145,38 @@ def safe_call(fn, *args, **kwargs):
         time.sleep(2 ** attempt)
     return None, ("INFRA: " + last) if _is_infra(last) else last
 
+STARVE_MIN_REASONING = 3000   # 正文为空且思维链超过这个长度, 判为疑似被 max_tokens 截断
+
+
+def _is_starved(r):
+    """正文为空但思维链很长 —— 推理模型在本地引擎上把预算全花在 thinking 了,
+    答案要么没出来要么是半截草稿, 这种失败不能算模型能力。"""
+    if not r:
+        return False
+    return not (r.get("text") or "").strip() and len(r.get("reasoning") or "") >= STARVE_MIN_REASONING
+
+
+def call_with_budget(args, messages, max_tokens, tools=None):
+    """调用一次; 若疑似思维链截断, 用 2 倍预算(上限 32768)自动重试一次。
+    返回 (r, err, retried)。"""
+    r, err = safe_call(api_chat, args.base_url, args.model, messages,
+                       max_tokens=max_tokens, temperature=0, tools=tools,
+                       timeout=args.timeout, api_key=args.api_key)
+    if err or not _is_starved(r) or getattr(args, "no_starved_retry", False):
+        return r, err, False
+    bigger = min(max_tokens * 2, 32768)
+    if bigger == max_tokens:
+        return r, err, False
+    print("  [starved] 思维链 %d 字且正文空, 用 max_tokens=%d 重试" % (
+        len((r or {}).get("reasoning") or ""), bigger), flush=True)
+    r2, err2 = safe_call(api_chat, args.base_url, args.model, messages,
+                         max_tokens=bigger, temperature=0, tools=tools,
+                         timeout=args.timeout, api_key=args.api_key)
+    if err2:
+        return r, err, True          # 重试也失败: 保留首次结果, 但标记已重试
+    return r2, None, True
+
+
 # ============================================================ 工具: 代码提取与本地验证
 
 def answer_text(r):
@@ -277,13 +309,14 @@ def run_java_tests(code, cases, timeout=30):
             f.write(src)
         rc, out, err = _run_cmd(["javac", "-encoding", "UTF-8", "Harness.java"], d, timeout)
         if rc != 0:
-            return 0, len(cases), ["javac 编译失败: %s" % err.splitlines()[-1][:180] if err else "?"]
+            lines = [l.strip() for l in (err or "").splitlines() if l.strip()][:3]
+            return 0, len(cases), ["javac 编译失败: " + (" | ".join(lines)[:400] if lines else "?")]
         rc, out, err = _run_cmd(["java", "-cp", ".", "Harness"], d, timeout)
         reported = sum(1 for l in out.splitlines() if l.startswith("CASE "))
         # 一个用例结果都没输出(启动即崩/超时)才算整体运行失败
         if rc != 0 and reported == 0:
-            tail = (err or out).strip().splitlines()
-            return 0, len(cases), ["运行失败: %s" % (tail[-1][:180] if tail else "?")]
+            tail = [l.strip() for l in (err or out).strip().splitlines() if l.strip()][:3]
+            return 0, len(cases), ["运行失败: " + (" | ".join(tail)[:400] if tail else "?")]
         for line in out.splitlines():
             if line.startswith("CASE PASS"):
                 results += 1
@@ -923,11 +956,11 @@ def bench_hard(args):
     # --- B+ 多语言代码题 ---
     print("== Hard B+: 多语言代码 ==", flush=True)
     for task in ht.HARD_CODE_TASKS:
-        r, err = safe_call(api_chat, args.base_url, args.model,
-                           [{"role": "user", "content": task["prompt"]}],
-                           max_tokens=args.max_tokens_override or 4096,
-                           temperature=0, timeout=args.timeout, api_key=args.api_key)
-        item = {"id": task["id"], "name": task["name"], "ok": False}
+        mt = args.max_tokens_override or 4096
+        r, err, retried = call_with_budget(
+            args, [{"role": "user", "content": task["prompt"]}], mt)
+        item = {"id": task["id"], "name": task["name"], "ok": False,
+                "max_tokens": mt, "starved": _is_starved(r), "starved_retry": retried}
         if err:
             item["error"] = err
             out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
@@ -946,17 +979,18 @@ def bench_hard(args):
         if best is None:
             best = (0, len(task["cases"]), ["未找到代码块"])
         item.update({"passed": best[0], "total": best[1], "ok": best[0] == best[1],
-                     "fails": best[2], "n_code_blocks": len(blocks), "raw": raw[:4000]})
+                     "fails": best[2], "n_code_blocks": len(blocks), "raw": raw[:4000],
+                     "code_blocks": [b.strip()[:3000] for b in blocks][:2]})
         out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
 
     # --- H 爬虫/HTML 静态题 ---
     print("== Hard H: 爬虫/HTML ==", flush=True)
     for task in ht.HARD_SCRAPE_TASKS:
-        r, err = safe_call(api_chat, args.base_url, args.model,
-                           [{"role": "user", "content": task["prompt"]}],
-                           max_tokens=args.max_tokens_override or 4096,
-                           temperature=0, timeout=args.timeout, api_key=args.api_key)
-        item = {"id": task["id"], "name": task["name"], "ok": False}
+        mt = args.max_tokens_override or 4096
+        r, err, retried = call_with_budget(
+            args, [{"role": "user", "content": task["prompt"]}], mt)
+        item = {"id": task["id"], "name": task["name"], "ok": False,
+                "max_tokens": mt, "starved": _is_starved(r), "starved_retry": retried}
         if err:
             item["error"] = err
             out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
@@ -974,7 +1008,8 @@ def bench_hard(args):
         if best is None:
             best = (0, len(task["cases"]), ["未找到代码块"])
         item.update({"passed": best[0], "total": best[1], "ok": best[0] == best[1],
-                     "fails": best[2], "n_code_blocks": len(blocks), "raw": raw[:4000]})
+                     "fails": best[2], "n_code_blocks": len(blocks), "raw": raw[:4000],
+                     "code_blocks": [b.strip()[:3000] for b in blocks][:2]})
         out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
 
     # --- H3 分页爬取（mock server 真实 HTTP） ---
@@ -992,11 +1027,11 @@ def bench_hard(args):
     # --- D 难题 ---
     print("== Hard D+: 难题 ==", flush=True)
     for task in ht.HARD_QA_TASKS:
-        r, err = safe_call(api_chat, args.base_url, args.model,
-                           [{"role": "user", "content": task["prompt"]}],
-                           max_tokens=args.max_tokens_override or 4096,
-                           temperature=0, timeout=args.timeout, api_key=args.api_key)
-        item = {"id": task["id"], "topic": task["topic"]}
+        mt = args.max_tokens_override or 4096
+        r, err, retried = call_with_budget(
+            args, [{"role": "user", "content": task["prompt"]}], mt)
+        item = {"id": task["id"], "topic": task["topic"], "max_tokens": mt,
+                "starved": _is_starved(r), "starved_retry": retried}
         if err:
             item["error"] = err
         elif task.get("cases"):
@@ -1013,12 +1048,13 @@ def bench_hard(args):
             if best is None:
                 best = (0, len(task["cases"]), ["未找到代码块"])
             item.update({"passed": best[0], "total": best[1],
-                         "ok": best[0] == best[1], "fails": best[2]})
+                         "ok": best[0] == best[1], "fails": best[2],
+                         "code_blocks": [b.strip()[:3000] for b in blocks][:2]})
         else:
             ans = extract_answer(answer_text(r))
             item["answer_line"] = ans[:60]
             item["ok"] = bool(task["check"](ans))
-        item["raw"] = answer_text(r)[:4000]
+        item["raw"] = (answer_text(r) if r is not None else "")[:4000]
         out.append(item); print(json.dumps(item, ensure_ascii=False), flush=True)
     # 难度档标注(仅展示) + infra 错误标记
     for x in out:
@@ -1049,7 +1085,8 @@ def summarize_hard(hard):
          "hard_pct": "%.0f%%" % (100.0 * passed / n),
          "hard_cases": "%d/%d" % (sum(x.get("passed", 1 if x.get("ok") else 0) for x in hard),
                                   sum(x.get("total", 1) for x in hard)),
-         "hard_errors": sum(1 for x in hard if x.get("infra"))}
+         "hard_errors": sum(1 for x in hard if x.get("infra")),
+         "hard_starved": sum(1 for x in hard if x.get("starved"))}
     groups = {}
     for x in hard:
         g = _group_of(x["id"])
@@ -1072,6 +1109,11 @@ def gen_hard_report_md(hard, meta, summary):
     L.append("- **测试时间**：%s" % meta.get("time"))
     L.append("- **采样**：temperature=0（贪心解码，结果可复现）")
     L.append("- **判分口径**：一道题的全部用例通过才算 1 道；总分 = 通过题数 / 总题数，不加权")
+    if meta.get("max_tokens"):
+        L.append("- **输出预算**：max_tokens=%s%s" % (
+            meta["max_tokens"],
+            "（推理模型请确认思维链是否计入；本地引擎会计入，需放大预算）"
+            if meta.get("local_endpoint") else ""))
     if meta.get("task_hash"):
         L.append("- **题库版本**：`%s`（只可与同版本结果对比）" % meta["task_hash"])
     L.append("")
@@ -1105,6 +1147,12 @@ def gen_hard_report_md(hard, meta, summary):
         L.append("")
         L.append("> ⚠️ %d 道为 ERROR（超时/5xx，已重试仍失败），按未通过计：%s。建议重跑确认。"
                  % (len(errs), "、".join(errs)))
+    starved = [x["id"] for x in hard if x.get("starved")]
+    if starved:
+        L.append("")
+        L.append("> ⚠️ %d 道正文为空且思维链超长（疑似被 max_tokens 截断，已自动加倍预算重试过一次）：%s。"
+                 "这几道衡量的是输出预算，不是模型能力——加大 `--max-tokens-override` 后重跑再比较。"
+                 % (len(starved), "、".join(starved)))
     L.append("")
     L.append("## 逐项明细")
     L.append("")
@@ -1116,6 +1164,8 @@ def gen_hard_report_md(hard, meta, summary):
             res = "⚠️ ERROR"
         elif x.get("ok"):
             res = "✅"
+        elif x.get("starved"):
+            res = "⚠️ 截断(未测到)"
         else:
             p, tt = x.get("passed"), x.get("total")
             res = "❌ %d/%d 用例" % (p, tt) if (p is not None and tt) else "❌"
@@ -1125,8 +1175,10 @@ def gen_hard_report_md(hard, meta, summary):
             note = "; ".join(x["fails"])[:140]
         elif x.get("answer_line"):
             note = x["answer_line"][:60]
-        elif x.get("detail"):
-            note = json.dumps(x["detail"], ensure_ascii=False)[:140]
+        elif x.get("detail") and not x.get("ok"):
+            note = json.dumps(x.get("detail"), ensure_ascii=False)[:140]
+        elif x.get("final_answer_short"):
+            note = x["final_answer_short"][:80].replace("\n", " ")
         else:
             note = "✓"
         L.append("| %s | %s | %s | %s | %s |"
@@ -1164,6 +1216,8 @@ def main():
                     help="API key（建议经 BENCH_API_KEY 环境变量传入）")
     ap.add_argument("--suite", default="core", choices=["core", "hard", "all"],
                     help="core=原 21 项；hard=20 题等权套件；all=两者都跑")
+    ap.add_argument("--no-starved-retry", action="store_true",
+                    help="正文为空且思维链超长时不自动加倍 max_tokens 重试")
     ap.add_argument("--selftest", action="store_true",
                     help="只跑判分器自测: 用参考答案验证 20 道题的判分器是否 100%% 通过")
     args = ap.parse_args()
@@ -1201,12 +1255,19 @@ def main():
     th = task_hash()
     with open(os.path.join(args.out, "result.json"), "w", encoding="utf-8") as f:
         json.dump({"schema": SCHEMA, "task_hash": th, "model": args.model,
-                   "suite": args.suite, "summary": summary, "detail": result},
+                   "suite": args.suite,
+                   "run_args": {"max_tokens_override": args.max_tokens_override,
+                                "starved_retry": not args.no_starved_retry,
+                                "timeout": args.timeout,
+                                "base_url": args.base_url},
+                   "summary": summary, "detail": result},
                   f, ensure_ascii=False, indent=2)
 
+    local = any(h in args.base_url for h in ("localhost", "127.0.0.1", "0.0.0.0"))
     meta = {"model": args.model, "base_url": args.base_url,
             "quant": args.quant or "Q5_K_M(推测,可改)", "ctx": args.ctx or "-",
             "machine": args.machine or "本机", "task_hash": th,
+            "max_tokens": args.max_tokens_override or 4096, "local_endpoint": local,
             "time": time.strftime("%Y-%m-%d %H:%M")}
     if hard:
         md = gen_hard_report_md(hard, meta, summary)

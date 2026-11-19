@@ -379,6 +379,38 @@ def run():
     a7b = ht.agent_a7_crawl(fake_api_chat_factory(a7_bad_plan, a7_text), FakeArgs())
     check_bool("A7-n", not a7b.get("ok"), "抓外域应判不通过(实际 %s)" % a7b.get("ok"))
 
+    # ---- 回归用例 1: 关键数字落在 200 字之后, 仍须按全文判对(此前被截断误判)
+    long_text = ("查询完成。\n" + "\n".join("- 第 %d 行说明" % i for i in range(30))
+                 + "\n总价 = 100×0.9+15 = 105 元；库存 12 件，够买 2 件。")
+    a4_long = ht.agent_a4_order_chain(fake_api_chat_factory(a4_plan, long_text), FakeArgs())
+    check_bool("A4-long", bool(a4_long.get("ok")), "105 在 200 字之后仍应判过")
+
+    # ---- 回归用例 2: 漏抓 /c 必须判不通过(此前 >=4 页就放行)
+    a7_short = ht.agent_a7_crawl(fake_api_chat_factory(a7_plan[:-1], a7_text), FakeArgs())
+    check_bool("A7-c", not a7_short.get("ok"), "漏抓 /c 应判不通过")
+
+    # ---- 回归用例 3: 思维链截断检测 + 自动加倍预算重试
+    import lm_model_bench as lm
+    check_bool("starved", lm._is_starved({"text": "", "reasoning": "字" * 5000})
+               and not lm._is_starved({"text": "ok", "reasoning": "字" * 9999})
+               and not lm._is_starved({"text": "", "reasoning": "字" * 100}),
+               "正文空且思维链超长才算截断")
+    orig_api, calls = lm.api_chat, []
+
+    def starving(base_url, model, messages, max_tokens=512, **kw):
+        calls.append(max_tokens)
+        if max_tokens < 8192:
+            return {"text": "", "reasoning": "字" * 5000, "tool_calls": None}
+        return {"text": "答案：42", "reasoning": "", "tool_calls": None}
+
+    lm.api_chat = starving
+    try:
+        rr, ee, retried = lm.call_with_budget(FakeArgs(), [{"role": "user", "content": "x"}], 4096)
+    finally:
+        lm.api_chat = orig_api
+    check_bool("retry", bool(retried and rr and rr.get("text") == "答案：42" and calls == [4096, 8192]),
+               "自动加倍预算重试: %s" % calls)
+
     # ---- 判分器反向用例: 这些必须被判错, 否则就是假阳性
     q1 = next(t for t in ht.HARD_QA_TASKS if t["id"] == "D2")
     check_bool("pair", _pair_check("苹果 6 斤，香蕉 14 斤", "苹果", 6, "香蕉", 14)

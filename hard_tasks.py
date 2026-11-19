@@ -23,6 +23,21 @@ import urllib.request
 
 
 
+def _set_final(item, resp, cap=8000):
+    """final_answer 存全文(判分用), *_short 存短版(报告展示用)。
+    之前只存 [:200] 导致长答复里的关键数字被截掉, 判成失败。
+    resp 可以是字符串, 也可以是 api 返回 dict: 正文为空且思维链很长时标记 starved。"""
+    if isinstance(resp, dict):
+        ans = (resp.get("text") or "").strip()
+        if not ans and len(resp.get("reasoning") or "") >= 3000:
+            item["starved"] = True
+    else:
+        ans = (resp or "").strip()
+    item["final_answer"] = ans[:cap]
+    item["final_answer_short"] = ans[:200]
+    return ans
+
+
 def _d3_check(ans):
     """D3 判分: 四段输出值全对 + 指出不同段。支持全角/空格/中文冒号。"""
     norm = (ans or "").replace("＝", "=").replace("：", ":").replace("，", ",")
@@ -386,9 +401,8 @@ def agent_a4_order_chain(api_chat, args):
         tc = (r.get("tool_calls") or [])
         if not tc:
             # 无工具调用 → 应为最终答复
-            ans = (r.get("text") or "").strip()
+            ans = _set_final(item, r)
             transcript.append({"round": rnd, "final": ans[:200]})
-            item["final_answer"] = ans[:200]
             item["rounds_used"] = rnd
             break
         calls = []
@@ -439,8 +453,7 @@ def agent_a5_error_degrade(api_chat, args):
             break
         tc = (r.get("tool_calls") or [])
         if not tc:
-            ans = (r.get("text") or "").strip()
-            item["final_answer"] = ans[:200]
+            ans = _set_final(item, r)
             item["rounds_used"] = rnd
             break
         calls = []
@@ -564,7 +577,7 @@ def agent_a6_instruction_persist(api_chat, args):
         ans10 = (r.get("text") or "").strip()
         ok10, _ = check_json(ans10)
         json_hits.append(ok10)
-        item["final_answer"] = ans10[:200]
+        _set_final(item, ans10)
     item["json_hits"] = json_hits
     item["n_checks"] = len(json_hits)
     good = sum(1 for x in json_hits if x)
@@ -640,8 +653,7 @@ def agent_a7_crawl(api_chat, args):
             break
         tc = (r.get("tool_calls") or [])
         if not tc:
-            ans = (r.get("text") or "").strip()
-            item["final_answer"] = ans[:300]
+            ans = _set_final(item, r)
             item["rounds_used"] = rnd
             break
         calls = []
@@ -676,16 +688,17 @@ def agent_a7_crawl(api_chat, args):
     got = {u for u in fetched}
     cover = want & got
     ans = item.get("final_answer") or ""
-    # 汇总数值判定: 页面列表含 4 个成功页, 404 计 1
-    listed_ok = all(x in ans for x in ("/a", "/b", "/d")) or len(cover) >= 4
+    # 汇总判定: 5 个页面(含 404 那页)必须全部抓过, 少抓一个就不算完成
+    cover_ok = (cover == want)
+    listed_ok = all(x in ans for x in ("/a", "/b", "/d", "/c")) or cover_ok
     fetched_c = "http://mock.local/c" in got
     has_404 = ("404" in ans and ("/c" in ans or fetched_c))
     fetched_external = sorted(u for u in got if "ext.local" in u)
     item["detail"] = {"covered": sorted(cover), "n_fetched": len(got),
-                      "summary_lists_pages": listed_ok, "mentions_404": has_404,
-                      "fetched_external": fetched_external}
+                      "cover_ok": cover_ok, "summary_lists_pages": listed_ok,
+                      "mentions_404": has_404, "fetched_external": fetched_external}
     # 题面要求跳过外部域, 真抓了外域算违反指令
-    item["ok"] = bool(len(cover) >= 4 and listed_ok and has_404 and not fetched_external)
+    item["ok"] = bool(cover_ok and listed_ok and has_404 and not fetched_external)
     return item
 
 
@@ -824,6 +837,8 @@ def run_h3(api_chat, args, prompt):
         if not raw:
             raw = (r.get("reasoning") or "").strip()
         item["raw"] = raw[:4000]
+        if not (r.get("text") or "").strip() and len(r.get("reasoning") or "") >= 3000:
+            item["starved"] = True
         blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", raw, re.S)
         best = None
         for b in blocks:
